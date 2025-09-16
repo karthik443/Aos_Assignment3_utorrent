@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <iostream>
 #include <stdexcept>
+#include <arpa/inet.h>
 #include <thread>
 using namespace std;
 
@@ -15,6 +16,116 @@ void error(const char *msg)
     perror(msg);
     exit(1);
 }
+
+void heartBeat_Sender(const string &peerIp, int peer_port,int myport){
+
+    try
+    {
+        
+    
+    while(true){
+        int sockFd = socket(AF_INET,SOCK_STREAM,0);
+        if(sockFd<0){
+            cout<<"Faile to connect to Reciever socker\n";
+            // break;
+            // throw runtime_error("Failed to connect Reciever socket");
+        }
+    
+    sockaddr_in peer_addr{};
+    peer_addr.sin_family = AF_INET;
+    peer_addr.sin_port = htons(peer_port);
+    inet_pton(AF_INET,peerIp.c_str(),&peer_addr.sin_addr);
+    
+
+    if(connect(sockFd,(sockaddr*)&peer_addr,sizeof(peer_addr))==0){
+        cout<<"[Sender] connected to peer. sending hearbeats"<<endl;
+        while (true)
+        {
+            string hb = "heartbeat to : "+ to_string(peer_port)+" , From "+to_string(myport);
+            if(send(sockFd,hb.c_str(),hb.size(),0)<=0){
+                cout<<"[Sender] connection lost. will retry .."<<endl;
+                break;
+            }
+            this_thread::sleep_for(chrono::seconds(1));
+        }
+        
+    }
+    else{
+        cout<<"[Sender] could not connect to peer. Retrying.."<<endl;
+    }
+    close(sockFd);
+    this_thread::sleep_for(chrono::seconds(2));
+
+    }
+
+
+    }
+    catch(const std::exception& e)
+    {
+        std::cerr << e.what() << '\n';
+    }
+
+}
+void heartBeatRecv(int listen_port){
+
+    try
+    {
+        int serverFd = socket(AF_INET,SOCK_STREAM,0);
+        if(serverFd<0){
+            
+            throw runtime_error("Unable to open connect to sender");
+        }
+        sockaddr_in serv_addr{};
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_addr.s_addr = INADDR_ANY;
+        serv_addr.sin_port = htons(listen_port);
+        int opt = 1;;
+
+
+        setsockopt(serverFd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
+        if(bind(serverFd,(sockaddr*)&serv_addr,sizeof(serv_addr))<0){
+            throw runtime_error("bind");
+        }
+        listen(serverFd,5);
+        cout<<"[Reciver] listening for hearbeats on port"<<listen_port<<endl;
+
+        while(true){
+            sockaddr_in client_addr{};
+            socklen_t len = sizeof(client_addr);
+              cout << "[Receiver] Waiting for a new connection..." << endl;
+            int clientFd = accept(serverFd,(sockaddr *)&client_addr,&len);
+            cout<<clientFd<<endl;
+            if (clientFd < 0) {
+                perror("[Receiver] accept failed");
+                continue; // Keep trying instead of exiting program
+            }
+            cout<<"[Reciever] Peer connected\n";
+
+            char buffer[128];
+            auto last_rev = chrono::steady_clock::now();
+            while(true){
+                size_t bytes = recv(clientFd,buffer,sizeof(buffer)-1,0);
+                if(bytes<=0){
+                    cout<<"[Reciver] Lost connection to peer \n";
+                    close(clientFd);
+                    break;
+                }
+                buffer[bytes] = '\0';
+                last_rev = chrono::steady_clock::now();
+                cout<<"[Reciever] Got heartbeat: "<<buffer<<endl;
+            }
+
+        }
+
+    }
+    catch(const std::exception& e)
+    {
+        cout<<"I'm in catch";
+        std::cerr << e.what() << '\n';
+    }
+    
+}
+
 
 void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
     try
@@ -25,7 +136,9 @@ void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
         char buffer[1024];
         ssize_t bytes= recv(clientSock_fd,buffer,sizeof(buffer)-1,0);
         if(bytes<=0){
-            throw runtime_error("Unable fetch info from client");
+            cout<<"Unable fetch info from client"<<endl;
+            break;
+            
         }
         buffer[bytes] = '\0';
         
@@ -52,7 +165,11 @@ int main(int argc, char *argv[])
     {
         /* code */
     
-    
+    if(argc!=2){
+        throw runtime_error("Incorrect args");
+    }
+    int port = stoi(argv[1]);
+    // int ipaddr = 
     int sock_fd;
     sock_fd= socket(AF_INET,SOCK_STREAM,0);
     if(sock_fd==-1){
@@ -60,13 +177,17 @@ int main(int argc, char *argv[])
     }
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(5001);
+    addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
     bind(sock_fd,(sockaddr * )&addr,sizeof(addr));  
     listen(sock_fd, SOMAXCONN);
 
-    cout << "Tracker running on port 5000...\n";
+    cout << "Tracker running on "<<port<<" ...\n";
+
+//hearbeat threads 
+    thread hb_recv(heartBeatRecv, port + 100);  // listen for peer on port+100
+    thread hb_send(heartBeat_Sender, "127.0.0.1", (port == 5000 ? 5101 : 5100),port); // send to peer's hb port
 
     while(true){
         sockaddr_in clientSockAddr;
@@ -78,6 +199,8 @@ int main(int argc, char *argv[])
         
         thread(handleClient,newSocket_fd,clientSockAddr).detach();
     }
+    hb_recv.join();
+    hb_send.join();
 
     }
     catch(const std::exception& e)
