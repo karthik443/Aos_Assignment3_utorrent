@@ -10,6 +10,8 @@
 #include <arpa/inet.h>
 #include <thread>
 #include <signal.h>
+#include <mutex>
+
 using namespace std;
 
 void error(const char *msg)
@@ -19,13 +21,11 @@ void error(const char *msg)
 }
 
 
-void ignoreSigPipe() {
-    struct sigaction sa;
-    sa.sa_handler = SIG_IGN;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGPIPE, &sa, NULL);
-}
+enum Tracker_role {PRIMARY,SECONDARY};
+Tracker_role role;
+mutex state_mutex;
+bool peerAlive = true;
+
 
 void heartBeat_Sender(const string &peerIp, int peer_port){
 
@@ -97,8 +97,8 @@ void heartBeatRecv(int listen_port){
         listen(serverFd,5);
         cout<<"[Reciver] listening for hearbeats on port  :"<<listen_port<<endl;
 
-        while(true){
-            // cout<<"Reciever looping again";
+        while(true && peerAlive){
+            cout<<"Reciever looping again";
             sockaddr_in client_addr{};
             socklen_t len = sizeof(client_addr);
 
@@ -114,10 +114,12 @@ void heartBeatRecv(int listen_port){
             while(true){
                 size_t bytes = recv(clientFd,buffer,sizeof(buffer)-1,0);
                 if(bytes<=0){
+                    peerAlive = false;
                     cout<<"[Reciver] Lost connection to peer \n";
                     close(clientFd);
                     break;
                 }
+                peerAlive = true;
                 buffer[bytes] = '\0';
                 last_rev = chrono::steady_clock::now();
                 cout<<"[Reciever] Got heartbeat: "<<buffer<<endl;
@@ -133,6 +135,16 @@ void heartBeatRecv(int listen_port){
     
 }
 
+void monitorPeer() {
+    while(true){
+        this_thread::sleep_for(chrono::seconds(1));
+        if(role == Tracker_role::SECONDARY && peerAlive == false){
+            cout << "[Monitor] Secondary taking primary position" << endl;
+            role = Tracker_role::PRIMARY;
+            peerAlive = true; // prevent repeated promotion
+        }
+    }
+}
 
 void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
     try
@@ -143,14 +155,19 @@ void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
         char buffer[1024];
         ssize_t bytes= recv(clientSock_fd,buffer,sizeof(buffer)-1,0);
         if(bytes<=0){
-            perror("Unable fetch info from client");
-            continue;
+            perror("client connection failed");
+            // continue;
+            break;
         }
         buffer[bytes] = '\0';
-        
         cout<<"client: "<<buffer;
+        if(role==Tracker_role::PRIMARY){
+            lock_guard<mutex> lock(state_mutex);
+            cout<<"[Primary] Serving client request ";
+        }else{
+            cout<<"[secondary] Ignoring client request ";
+        }
         string message = "Server: " + string(buffer);
-       // bzero(buffer,sizeof(buffer));
         int n  = write(clientSock_fd, message.c_str(), message.length());
         if (n < 0) perror("ERROR writing to socket");
     }
@@ -169,12 +186,17 @@ int main(int argc, char *argv[])
 {
     try
     {
-        /* code */
-    ignoreSigPipe();
+
+    signal(SIGPIPE,SIG_IGN);
     if(argc!=2){
         throw runtime_error("Incorrect args");
     }
     int port = stoi(argv[1]);
+    role = (port==5000? Tracker_role::PRIMARY : Tracker_role::SECONDARY);
+
+       cout << "Tracker running on port " << port
+         << " Role: " << ((role == Tracker_role::PRIMARY) ? "PRIMARY" : "SECONDARY") << endl;
+
     // int ipaddr = 
     int sock_fd;
     sock_fd= socket(AF_INET,SOCK_STREAM,0);
@@ -192,22 +214,39 @@ int main(int argc, char *argv[])
     cout << "Tracker running on "<<port<<" ...\n";
 
 //hearbeat threads 
-    thread hb_recv(heartBeatRecv, port + 100);  // listen for peer on port+100
-    thread hb_send(heartBeat_Sender, "127.0.0.1", (port == 5000 ? 5101 : 5100)); // send to peer's hb port
+    thread hb_thread;
+    if(role==Tracker_role::PRIMARY){
+      hb_thread =  thread(heartBeat_Sender, "127.0.0.1", (port == 5000 ? 5101 : 5100)); // send to peer's hb port
+    }else{
+      hb_thread =  thread(heartBeatRecv, port + 100);  // listen for peer on port+100
 
+    }
+    hb_thread.detach();
+    thread monitorThread(monitorPeer);
+    monitorThread.detach();
     while(true){
+        // if(role==Tracker_role::SECONDARY && peerAlive==false){
+        //     cout<<"Secondary taking primary position"<<endl;
+        //     role = Tracker_role::PRIMARY;
+        //     peerAlive = true;
+        // }
         sockaddr_in clientSockAddr;
         socklen_t len = sizeof(clientSockAddr);
         int newSocket_fd = accept(sock_fd,(sockaddr*)&clientSockAddr,&len);
-        if(newSocket_fd==-1){
-            perror("Unable to accept socket fd");
-            continue;
-        }
+        if(newSocket_fd<=0){
+            this_thread::sleep_for(chrono::milliseconds(100));
+            // perror("Unable to accept socket fd");
+            // continue;
+        }else{
+              thread(handleClient,newSocket_fd,clientSockAddr).detach();
+        }   
         
-        thread(handleClient,newSocket_fd,clientSockAddr).detach();
+      
     }
-    hb_recv.join();
-    hb_send.join();
+
+    
+    
+    
 
     }
     catch(const std::exception& e)
