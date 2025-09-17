@@ -17,6 +17,8 @@
 #include<sstream>
 #include<string>
 #include<unordered_map>
+#include<unordered_set>
+#include<algorithm>
 
 #include "readFile.h"
 
@@ -51,17 +53,281 @@ struct Group
 {
     string groupId;
     string ownerId;
-    vector<string> members;               
+    unordered_set<string> members;               
     vector<string> joinRequests; 
 };
 
 
 unordered_map<string, User> users;       // userId -> User
 unordered_map<string, Group> groups;     // groupId -> Group
-
+unordered_map<int, string> sessionMap; 
 ////////////////////////////////////////////////
 
 
+
+
+void appendCommandLog(const string cmd){
+    lock_guard<mutex>lock(state_mutex);
+    commandLog.push_back(cmd);
+}
+void monitorPeer() {
+    while(true){
+        this_thread::sleep_for(chrono::seconds(1));
+        if(role == Tracker_role::SECONDARY && peerAlive == false){
+            cout << "[Monitor] Secondary taking primary position" << endl;
+            role = Tracker_role::PRIMARY;
+            peerAlive = true; // prevent repeated promotion
+        }
+    }
+}
+//////////////////////////////////////////////////////client command Executors 
+
+string getLoggedInUser(int clientSock) {
+    if (sessionMap.find(clientSock) != sessionMap.end()) {
+        return sessionMap[clientSock];
+    }
+    return "";
+}
+
+void sendResponse(int clientSock, const string& message) {
+    if(role==Tracker_role::PRIMARY){
+        string msg = message + "\n";
+        send(clientSock, msg.c_str(), msg.size(), 0);
+    }
+   
+}
+
+void handleCreateUser(const string& userId, const string& password, int clientSock) {
+    if (users.find(userId) != users.end()) {
+        sendResponse(clientSock, "User already exists");
+        return;
+    }
+
+    users[userId] = User{userId, password, false};
+    cout<<"start : "<<userId<<" -userid ,"<<users.count(userId)<<endl;
+    sendResponse(clientSock, "User created successfully");
+}
+void handleLogin(string userId,const string password, int clientSock) {
+    for(auto [key,value]:users){
+        cout<<key<<endl;
+    }
+    cout<<"  users size"<<users.size()<<endl;
+    auto it = users.find(userId);
+    cout<<users.count(userId)<<" : userid found\n";
+    if (it == users.end()) {
+        sendResponse(clientSock, "User not found");
+        return;
+    }
+    if (it->second.Password != password) {
+        sendResponse(clientSock, "Invalid password");
+        return;
+    }
+    it->second.isLoggedin = true;
+    sessionMap[clientSock] = userId;
+    sendResponse(clientSock, "Login successful");
+}
+
+void handleCreateGroup(const string& groupId, int clientSock) {
+    string userId = getLoggedInUser(clientSock); // map socket -> user
+    if (userId.empty()) {
+        sendResponse(clientSock, "You must login first");
+        return;
+    }
+
+    if (groups.find(groupId) != groups.end()) {
+        sendResponse(clientSock, "Group already exists");
+        return;
+    }
+
+    groups[groupId] = Group{groupId, userId, {userId}, {}};
+    sendResponse(clientSock, "Group created successfully");
+}
+void handleJoinGroup(const string& groupId, int clientSock) {
+    string userId = getLoggedInUser(clientSock);
+    if (userId.empty()) {
+        sendResponse(clientSock, "You must login first");
+        return;
+    }
+
+    auto it = groups.find(groupId);
+    if (it == groups.end()) {
+        sendResponse(clientSock, "Group does not exist");
+        return;
+    }
+
+    // Prevent duplicate join request
+    if (find(it->second.joinRequests.begin(), it->second.joinRequests.end(), userId) != it->second.joinRequests.end()) {
+        sendResponse(clientSock, "Join request already sent");
+        return;
+    }
+
+    it->second.joinRequests.push_back(userId);
+    sendResponse(clientSock, "Join request sent to group owner");
+}
+void handleLeaveGroup(const string& groupId, int clientSock){
+    string userId = getLoggedInUser(clientSock);
+    if(userId.empty()){
+        sendResponse(clientSock, "You must login first");return ;
+        
+    }
+    if(groups.count(groupId)==0){
+        sendResponse(clientSock, "Group Id doesn't exist");return;
+    }
+    Group g = groups[groupId];
+    if(g.ownerId==userId){
+        sendResponse(clientSock, "you are the Owner of group. you cannot exit");return;
+    }
+    if(g.members.count(userId)){
+        sendResponse(clientSock,"You are not a member of that group");return ;
+    }
+    //////////////////////// user is member of group
+    g.members.erase(userId);
+    sendResponse(clientSock,"Left the group with id: "+groupId);
+
+}
+void handleListGroups(int clientSock) {
+    if (groups.empty()) {
+        sendResponse(clientSock, "No groups available");
+        return;
+    }
+
+    string response = "Available groups:\n";
+    for (const auto &p : groups) {
+        response += p.first + " (Owner: " + p.second.ownerId + ")\n";
+    }
+
+    sendResponse(clientSock, response);
+}
+void handleListRequests(const string& groupId, int clientSock) {
+    string userId = getLoggedInUser(clientSock);
+    if (userId.empty()) {
+        sendResponse(clientSock, "You must login first");
+        return;
+    }
+
+    if (groups.count(groupId) == 0) {
+        sendResponse(clientSock, "Group Id doesn't exist");
+        return;
+    }
+
+    Group &g = groups[groupId];
+    if (g.ownerId != userId) {
+        sendResponse(clientSock, "Only group owner can see join requests");
+        return;
+    }
+
+    if (g.joinRequests.empty()) {
+        sendResponse(clientSock, "No pending requests for group " + groupId);
+        return;
+    }
+
+    string response = "Pending join requests for " + groupId + ":\n";
+    for (const auto &reqUser : g.joinRequests) {
+        response += "- " + reqUser + "\n";
+    }
+
+    sendResponse(clientSock, response);
+}
+void handleAcceptRequest(const string& groupId, const string& reqUserId, int clientSock) {
+    string userId = getLoggedInUser(clientSock);
+    if (userId.empty()) {
+        sendResponse(clientSock, "You must login first");
+        return;
+    }
+
+    if (groups.count(groupId) == 0) {
+        sendResponse(clientSock, "Group Id doesn't exist");
+        return;
+    }
+
+    Group &g = groups[groupId];
+    if (g.ownerId != userId) {
+        sendResponse(clientSock, "Only group owner can accept requests");
+        return;
+    }
+    
+    auto it = find(g.joinRequests.begin(), g.joinRequests.end(), reqUserId);
+    if (it != g.joinRequests.end()) {
+        g.joinRequests.erase(it);
+        g.members.insert(reqUserId);
+        sendResponse(clientSock, "Accepted join request. " + reqUserId +
+                                    " is now a member of group " + groupId);
+    } else {
+        sendResponse(clientSock, "No join request from user " + reqUserId);
+    }
+    return;
+    
+
+}
+void handleLogout(int clientSock){
+    string userId = sessionMap[clientSock];
+        users[userId].isLoggedin = false;
+        sessionMap.erase(clientSock);
+        sendResponse(clientSock, "user LoggedOut");
+}
+
+void CommandExecutor(string input,int clientSock){
+    vector<string> tokens = split(input, ' ');
+    // for(string token:tokens){
+    //     cout<<token<<" , ";
+    // }
+    if (tokens.empty()) {
+        sendResponse(clientSock, "Invalid command");
+        return;
+    }
+
+    string command = tokens[0];
+    // cout<<"command: "<<command<<" :-command"<<endl;
+    if (command == "create_user" && tokens.size()== 3 ) {
+        handleCreateUser(tokens[1], tokens[2], clientSock);
+    }
+    else if (command == "login" && tokens.size() == 3) {
+        handleLogin(tokens[1], tokens[2], clientSock);
+    }
+    else if (command == "create_group" && tokens.size() == 2) {
+        handleCreateGroup(tokens[1], clientSock);
+    }
+    else if (command == "join_group" && tokens.size() == 2 ) {
+        handleJoinGroup(tokens[1], clientSock);
+    }
+    else if (command == "leave_group" && tokens.size() == 2 ) {
+        handleLeaveGroup(tokens[1], clientSock);
+    }
+    else if (command == "list_groups" && tokens.size() == 1 ) {
+        handleListGroups( clientSock);
+    }
+    else if (command == "list_requests" && tokens.size() == 2 ) {
+        handleListRequests(tokens[1], clientSock);
+    }
+     else if (command == "accept_request" && tokens.size() == 3 ) {
+        handleAcceptRequest(tokens[1],tokens[2], clientSock);
+    }
+    else if(command=="logout"){
+        handleLogout(clientSock);
+    }
+    else {
+        cout<<"Unknown command"<<endl;
+        sendResponse(clientSock, "Unknown command");
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////////////////////////////client Command Executors 
+
+
+
+
+
+///////////////Heartbeat sender & reciever codes 
 
 void replicateCommand(const string &cmd) {
     lock_guard<mutex> lock(hbSendMutex);
@@ -127,7 +393,7 @@ void heartBeat_Sender(const string &peerIp, int peer_port){
         
     }
     else{
-        cout<<"[Sender] could not connect to peer. Retrying.."<<endl;
+        // cout<<"[Sender] could not connect to peer. Retrying.."<<endl;     peer not connected code
     }
     close(sockFd);
     this_thread::sleep_for(chrono::seconds(2));
@@ -197,7 +463,7 @@ void heartBeatRecv(int listen_port){
                     partial.erase(0, pos + 1);
 
                     if (line.rfind("heartbeat", 0) == 0) {
-                        cout << "[Receiver] Got heartbeat\n";
+                        // cout << "[Receiver] Got heartbeat\n";       //////////heartbeat reciever code
                     }
                     else if (line.rfind("sync:", 0) == 0) {
                         string cmd = line.substr(5);
@@ -206,6 +472,7 @@ void heartBeatRecv(int listen_port){
                         } else {
                             lock_guard<mutex> lock(state_mutex);
                             commandLog.push_back(cmd);
+                            CommandExecutor(cmd,-1);
                             cout << "[Receiver] Synced cmd: " << cmd << endl;
                         }
                     }
@@ -222,39 +489,14 @@ void heartBeatRecv(int listen_port){
     
 }
 
-void appendCommandLog(const string cmd){
-    lock_guard<mutex>lock(state_mutex);
-    commandLog.push_back(cmd);
-}
-void monitorPeer() {
-    while(true){
-        this_thread::sleep_for(chrono::seconds(1));
-        if(role == Tracker_role::SECONDARY && peerAlive == false){
-            cout << "[Monitor] Secondary taking primary position" << endl;
-            role = Tracker_role::PRIMARY;
-            peerAlive = true; // prevent repeated promotion
-        }
-    }
-}
-//////////////////////////////////////////////////////client command Executors 
 
 
 
 
 
 
+/// //////////////////////////////////
 
-
-
-
-
-
-
-
-
-
-
-/////////////////////////////////////////////////////client Command Executors 
 void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
     try
     {
@@ -274,14 +516,15 @@ void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
             // lock_guard<mutex> lock(state_mutex);
             string cmd(buffer);
             appendCommandLog(cmd);
+            CommandExecutor(cmd,clientSock_fd);
             replicateCommand(buffer);
             cout<<"[Primary] logged & Serving client request , current size: "<<commandLog.size()<<endl;
         }else{
             cout<<"[secondary] Ignoring client request ";
         }
-        string message = "Server: " + string(buffer);
-        int n  = write(clientSock_fd, message.c_str(), message.length());
-        if (n < 0) perror("ERROR writing to socket");
+        // string message = "Server: " + string(buffer);
+        // int n  = write(clientSock_fd, message.c_str(), message.length());
+        // if (n < 0) perror("ERROR writing to socket");
     }
    
    
@@ -332,7 +575,8 @@ int main(int argc, char *argv[])
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
-
+    int opt =1;
+    setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     bind(sock_fd,(sockaddr * )&addr,sizeof(addr));  
     listen(sock_fd, SOMAXCONN);
 

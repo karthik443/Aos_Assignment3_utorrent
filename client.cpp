@@ -73,9 +73,15 @@ int main(int argc , char * argv []){
         printf("Please enter any message: \n");
         bzero(buffer,256);
         fgets(buffer,255,stdin);
-        if (strcmp(buffer, "exit\n") == 0) {
+
+        size_t len = strlen(buffer);
+        if (len > 0 && buffer[len - 1] == '\n') {
+            buffer[len - 1] = '\0';
+        }
+        if (strcmp(buffer, "exit") == 0) {
              break;
         }
+
         int n = write(sock_fd,buffer,strlen(buffer));
         if(n<=0){
             cout << "[CLIENT] Connection lost. Retrying...\n";
