@@ -11,6 +11,7 @@
 #include <thread>
 #include <signal.h>
 #include <mutex>
+#include <vector>
 
 using namespace std;
 
@@ -22,9 +23,26 @@ void error(const char *msg)
 
 
 enum Tracker_role {PRIMARY,SECONDARY};
+vector<string>commandLog;
 Tracker_role role;
 mutex state_mutex;
+int hbSockFd = -1;  // GLOBAL
+mutex hbSendMutex;  // protect concurrent sends
 bool peerAlive = true;
+
+
+
+void replicateCommand(const string &cmd) {
+    lock_guard<mutex> lock(hbSendMutex);
+    if (hbSockFd != -1) {
+        string msg = "sync:" + cmd + "\n";
+        if (send(hbSockFd, msg.c_str(), msg.size(), 0) <= 0) {
+            cout << "[Replicator] Failed to send command to secondary." << endl;
+        } else {
+            cout << "[Replicator] Sent cmd: " << cmd << endl;
+        }
+    }
+}
 
 
 void heartBeat_Sender(const string &peerIp, int peer_port){
@@ -48,15 +66,33 @@ void heartBeat_Sender(const string &peerIp, int peer_port){
 
     if(connect(sockFd,(sockaddr*)&peer_addr,sizeof(peer_addr))==0){
         cout<<"[Sender] connected to peer. sending hearbeats"<<endl;
+        {
+            lock_guard<mutex> lock(hbSendMutex);
+            hbSockFd = sockFd;
+        }
+         {
+                    lock_guard<mutex> lock(state_mutex);
+                    for (auto &cmd : commandLog) {
+                        string msg = "sync:" + cmd + "\n";
+                        send(sockFd, msg.c_str(), msg.size(), 0);
+                    }
+                    string done = "sync:__SYNC_DONE__\n";
+                    send(sockFd, done.c_str(), done.size(), 0);
+        }
+
         while (true)
         {
-            string hb = "heartbeat destination :"+ to_string(peer_port);
+            string hb = "heartbeat destination :"+ to_string(peer_port)+"\n";
             if(send(sockFd,hb.c_str(),hb.size(),0)<=0){
                 cout<<"[Sender] connection lost. will retry .."<<endl;
                 break;
             }
             this_thread::sleep_for(chrono::seconds(1));
         }
+        {
+        lock_guard<mutex> lock(hbSendMutex);
+        hbSockFd = -1;
+         }
         
     }
     else{
@@ -110,19 +146,39 @@ void heartBeatRecv(int listen_port){
             cout<<"[Reciever] Peer connected\n";
 
             char buffer[128];
+            string partial;
             auto last_rev = chrono::steady_clock::now();
-            while(true){
-                size_t bytes = recv(clientFd,buffer,sizeof(buffer)-1,0);
-                if(bytes<=0){
+             while (true) {
+                ssize_t bytes = recv(clientFd, buffer, sizeof(buffer)-1, 0);
+                if (bytes <= 0) {
                     peerAlive = false;
-                    cout<<"[Reciver] Lost connection to peer \n";
+                    cout << "[Receiver] Lost connection to peer\n";
                     close(clientFd);
                     break;
                 }
                 peerAlive = true;
                 buffer[bytes] = '\0';
-                last_rev = chrono::steady_clock::now();
-                cout<<"[Reciever] Got heartbeat: "<<buffer<<endl;
+                partial.append(buffer);
+
+                size_t pos;
+                while ((pos = partial.find('\n')) != string::npos) {
+                    string line = partial.substr(0, pos);
+                    partial.erase(0, pos + 1);
+
+                    if (line.rfind("heartbeat", 0) == 0) {
+                        cout << "[Receiver] Got heartbeat\n";
+                    }
+                    else if (line.rfind("sync:", 0) == 0) {
+                        string cmd = line.substr(5);
+                        if (cmd == "__SYNC_DONE__") {
+                            cout << "[Receiver] Initial sync complete.\n";
+                        } else {
+                            lock_guard<mutex> lock(state_mutex);
+                            commandLog.push_back(cmd);
+                            cout << "[Receiver] Synced cmd: " << cmd << endl;
+                        }
+                    }
+                }
             }
 
         }
@@ -135,6 +191,10 @@ void heartBeatRecv(int listen_port){
     
 }
 
+void appendCommandLog(const string cmd){
+    lock_guard<mutex>lock(state_mutex);
+    commandLog.push_back(cmd);
+}
 void monitorPeer() {
     while(true){
         this_thread::sleep_for(chrono::seconds(1));
@@ -162,8 +222,11 @@ void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
         buffer[bytes] = '\0';
         cout<<"client: "<<buffer;
         if(role==Tracker_role::PRIMARY){
-            lock_guard<mutex> lock(state_mutex);
-            cout<<"[Primary] Serving client request ";
+            // lock_guard<mutex> lock(state_mutex);
+            string cmd(buffer);
+            appendCommandLog(cmd);
+            replicateCommand(buffer);
+            cout<<"[Primary] logged & Serving client request , current size: "<<commandLog.size()<<endl;
         }else{
             cout<<"[secondary] Ignoring client request ";
         }
