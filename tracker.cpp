@@ -10,8 +10,15 @@
 #include <arpa/inet.h>
 #include <thread>
 #include <signal.h>
+#include<unistd.h>
+ #include <fcntl.h>
 #include <mutex>
 #include <vector>
+#include<sstream>
+#include<string>
+#include<unordered_map>
+
+#include "readFile.h"
 
 using namespace std;
 
@@ -29,6 +36,30 @@ mutex state_mutex;
 int hbSockFd = -1;  // GLOBAL
 mutex hbSendMutex;  // protect concurrent sends
 bool peerAlive = true;
+
+////////////////////////////////////// STATE MANAGEMENT
+
+struct User
+{
+    string userId;
+    string Password;
+    bool isLoggedin = false;
+
+};
+
+struct Group
+{
+    string groupId;
+    string ownerId;
+    vector<string> members;               
+    vector<string> joinRequests; 
+};
+
+
+unordered_map<string, User> users;       // userId -> User
+unordered_map<string, Group> groups;     // groupId -> Group
+
+////////////////////////////////////////////////
 
 
 
@@ -205,7 +236,25 @@ void monitorPeer() {
         }
     }
 }
+//////////////////////////////////////////////////////client command Executors 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////////////////////////////client Command Executors 
 void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
     try
     {
@@ -245,17 +294,30 @@ void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
 
 }
 
+
+
 int main(int argc, char *argv[])
 {
     try
     {
-
+ 
     signal(SIGPIPE,SIG_IGN);
-    if(argc!=2){
+    if(argc!=3){
         throw runtime_error("Incorrect args");
     }
-    int port = stoi(argv[1]);
-    role = (port==5000? Tracker_role::PRIMARY : Tracker_role::SECONDARY);
+    string filepath = argv[1];
+    cout<<filepath<<" : filepath";
+   
+    vector<vector<string>>ports  = getPortVector(filepath);
+    cout<<"After \n";
+    int trackerNo = stoi(argv[2]);
+    trackerNo--;
+
+    int port = stoi(ports[trackerNo][1]);
+    int peerPort = stoi(ports[(trackerNo+1)%2][1]);
+    cout<<"port "<<port<<" peerport"<<peerPort<<endl;
+    string ipaddr = ports[trackerNo][0];
+    role = (trackerNo==0? Tracker_role::PRIMARY : Tracker_role::SECONDARY);
 
        cout << "Tracker running on port " << port
          << " Role: " << ((role == Tracker_role::PRIMARY) ? "PRIMARY" : "SECONDARY") << endl;
@@ -279,7 +341,7 @@ int main(int argc, char *argv[])
 //hearbeat threads 
     thread hb_thread;
     if(role==Tracker_role::PRIMARY){
-      hb_thread =  thread(heartBeat_Sender, "127.0.0.1", (port == 5000 ? 5101 : 5100)); // send to peer's hb port
+      hb_thread =  thread(heartBeat_Sender, "127.0.0.1",peerPort+100); // send to peer's hb port
     }else{
       hb_thread =  thread(heartBeatRecv, port + 100);  // listen for peer on port+100
 

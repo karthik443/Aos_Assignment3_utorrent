@@ -10,6 +10,8 @@
 #include<iostream>
 #include<vector>
 #include<signal.h>
+
+#include"readFile.h"
 using namespace std;
 
 
@@ -49,15 +51,24 @@ int main(int argc , char * argv []){
     try
     {
 
-        signal(SIGPIPE, SIG_IGN);
-    vector<int> trackerPorts = {5000, 5001};
+    signal(SIGPIPE, SIG_IGN);
+    vector<int> trackerPorts;
     
     
     char buffer [256];
     if(argc<3){
         throw runtime_error("Incorrect arguments");
     }
-    int sock_fd = connectToTracker(argv[1],trackerPorts);
+    string clientIp_port = argv[1];
+    string filepath = argv[2];
+    vector<vector<string>>ports  = getPortVector(filepath);
+    string hostname = ports[0][0];
+    int primaryPort = stoi(ports[0][1]);
+    int secondaryPort = stoi(ports[1][1]);
+    trackerPorts.push_back(primaryPort);
+    trackerPorts.push_back(secondaryPort);
+
+    int sock_fd = connectToTracker(hostname,trackerPorts);
     while(true){
         printf("Please enter any message: \n");
         bzero(buffer,256);
