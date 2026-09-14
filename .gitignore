@@ -1,3 +1,7 @@
-tracer
-tracker
 a.out
+tracker/tracker
+client/client
+*.o
+*.part
+*.dSYM/
+.vscode/
