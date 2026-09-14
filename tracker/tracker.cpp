@@ -1,621 +1,647 @@
+// ============================================================================
+// tracker.cpp - Tracker server for the P2P file-sharing system.
+//
+// Run as:  ./tracker <tracker_info.txt> <tracker_no>       (tracker_no is 1-based)
+//
+// ARCHITECTURE SUMMARY (see README.md for the full writeup)
+// -----------------------------------------------------------------------
+// tracker_info.txt lists every tracker as "<ip> <port>" pairs. The grading
+// setup uses exactly two (per the assignment spec), but nothing here is
+// hardcoded to that: the election and replication logic below work the
+// same way for any N >= 1, so scaling to more trackers later is just
+// adding a line to the file and starting another process.
+//
+// Election: trackers form a full mesh of TCP links to each other (one link
+// per pair) and exchange 1s heartbeats over it. Whichever tracker has the
+// *lowest configured index among those it currently sees as alive* acts as
+// PRIMARY; everyone else is SECONDARY. This is a simple static-priority
+// rule - easy to reason about, and it naturally reclaims primary status
+// for a low-index tracker that comes back online.
+//
+// Replication: only the PRIMARY accepts state-mutating client commands
+// (SECONDARY replies ERR NOT_PRIMARY <ip> <port> so the client can
+// transparently reconnect). Every accepted mutation is applied locally and
+// then pushed to every connected peer as a single-line "OP" message -
+// cheap and low-latency. To recover from any *missed* ops (a peer link
+// that was down for a while), every tracker keeps a monotonically
+// increasing `stateVersion` counter, bumped once per accepted/replayed
+// mutation. Whenever a peer link (re)connects, both sides exchange a full
+// state snapshot tagged with their current version; whichever side is
+// behind wholesale-adopts the other's snapshot. Because only the primary
+// ever originates new state, this converges correctly even across
+// primary handoffs: a returning ex-primary with stale data has a lower
+// version than the tracker that kept serving clients while it was down,
+// so it is the one that gets overwritten, not the other way around.
+//
+// Read-only queries (LIST_GROUPS, LIST_FILES, LIST_REQUESTS, GET_PEERS)
+// are answered by *any* tracker directly from its local (replicated)
+// state - this is what lets a client get accurate answers "regardless of
+// which tracker it connects to", as the spec requires, without forwarding
+// every read through the primary.
+// ============================================================================
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/types.h> 
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <iostream>
-#include <stdexcept>
 #include <arpa/inet.h>
+#include <poll.h>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <signal.h>
-#include<unistd.h>
- #include <fcntl.h>
+#include <fcntl.h>
 #include <mutex>
+#include <atomic>
+#include <deque>
 #include <vector>
-#include<sstream>
-#include<string>
-#include<unordered_map>
-#include<unordered_set>
-#include<algorithm>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <chrono>
 
-#include "readFile.h"
+#include "../common/utils.h"
+#include "../common/netio.h"
+#include "../common/protocol.h"
 
 using namespace std;
 
-void error(const char *msg)
-{
-    perror(msg);
-    exit(1);
-}
+// ---------------------------------------------------------------- STATE
 
-
-enum Tracker_role {PRIMARY,SECONDARY};
-vector<string>commandLog;
-Tracker_role role;
-mutex state_mutex;
-int hbSockFd = -1;  // GLOBAL
-mutex hbSendMutex;  // protect concurrent sends
-bool peerAlive = true;
-
-////////////////////////////////////// STATE MANAGEMENT
-
-struct User
-{
-    string userId;
-    string Password;
+struct User {
+    string id;
+    string password;
     bool isLoggedin = false;
-
+    string lastPeerIp;
+    int lastPeerPort = 0;
 };
 
-struct Group
-{
-    string groupId;
+struct Group {
+    string id;
     string ownerId;
-    unordered_set<string> members;               
-    vector<string> joinRequests; 
+    unordered_set<string> members;
+    vector<string> joinRequests;
 };
 
+struct FileInfo {
+    string fileName;
+    long long fileSize = 0;
+    int numPieces = 0;
+    string fileHash;
+    vector<string> pieceHashes;
+    string ownerId;
+    unordered_map<string, vector<bool>> seeders; // userId -> piece bitmap
+};
 
-unordered_map<string, User> users;       // userId -> User
-unordered_map<string, Group> groups;     // groupId -> Group
-unordered_map<int, string> sessionMap; 
-////////////////////////////////////////////////
+mutex stateMutex;
+uint64_t stateVersion = 0; // guarded by stateMutex
+unordered_map<string, User> users;
+unordered_map<string, Group> groups;
+unordered_map<string, unordered_map<string, FileInfo>> files; // groupId -> fileName -> FileInfo
 
-
-
-
-void appendCommandLog(const string cmd){
-    lock_guard<mutex>lock(state_mutex);
-    commandLog.push_back(cmd);
+// Must be called while holding stateMutex.
+bool loggedIn(const string &id) {
+    auto it = users.find(id);
+    return it != users.end() && it->second.isLoggedin;
 }
-void monitorPeer() {
-    while(true){
-        this_thread::sleep_for(chrono::seconds(1));
-        if(role == Tracker_role::SECONDARY && peerAlive == false){
-            cout << "[Monitor] Secondary taking primary position" << endl;
-            role = Tracker_role::PRIMARY;
-            peerAlive = true; // prevent repeated promotion
-        }
-    }
-}
-//////////////////////////////////////////////////////client command Executors 
-
-string getLoggedInUser(int clientSock) {
-    if (sessionMap.find(clientSock) != sessionMap.end()) {
-        return sessionMap[clientSock];
-    }
-    return "";
+bool isMember(const Group &g, const string &userId) {
+    return g.members.count(userId) > 0;
 }
 
-void sendResponse(int clientSock, const string& message) {
-    if(role==Tracker_role::PRIMARY){
-        string msg = message + "\n";
-        send(clientSock, msg.c_str(), msg.size(), 0);
-    }
-   
-}
+struct HandlerResult {
+    bool ok;
+    string message;
+};
 
-void handleCreateUser(const string& userId, const string& password, int clientSock) {
-    if (users.find(userId) != users.end()) {
-        sendResponse(clientSock, "User already exists");
-        return;
-    }
+const unordered_set<string> MUTATING_COMMANDS = {
+    "CREATE_USER", "LOGIN", "LOGOUT", "CREATE_GROUP", "JOIN_GROUP", "LEAVE_GROUP",
+    "ACCEPT_REQUEST", "REGISTER_FILE", "UPDATE_SEED", "STOP_SHARE"
+};
+bool isMutatingCommand(const string &cmd) { return MUTATING_COMMANDS.count(cmd) > 0; }
 
-    users[userId] = User{userId, password, false};
-    // cout<<"start : "<<userId<<" -userid ,"<<users.count(userId)<<endl;
-    
-    sendResponse(clientSock, "User created successfully");
-}
-void handleLogin(string userId,const string password, int clientSock) {
+// Applies one command line's worth of tokens to local state. Used both for
+// commands a live client sent to this (primary) tracker, and for "OP" lines
+// replayed from a peer tracker - in both cases the command already carries
+// the resolved user_id as an explicit argument, so no per-connection
+// session lookup is needed here (see README "Design notes" for why).
+HandlerResult applyCommand(const vector<string> &tokens) {
+    lock_guard<mutex> lock(stateMutex);
+    HandlerResult r{false, "Unknown command"};
+    if (tokens.empty()) return r;
+    const string &cmd = tokens[0];
 
-    if(!getLoggedInUser(clientSock).empty()){
-        sendResponse(clientSock, "Logout current User before login.");
-        return;
-    }
-    // cout<<"  users size"<<users.size()<<endl;
-    auto it = users.find(userId);
-    // cout<<users.count(userId)<<" : userid found\n";
-    if (it == users.end()) {
-        sendResponse(clientSock, "User not found");
-        return;
-    }
-    if (it->second.Password != password) {
-        sendResponse(clientSock, "Invalid password");
-        return;
-    }
-    it->second.isLoggedin = true;
-    sessionMap[clientSock] = userId;
-    sendResponse(clientSock, "Login successful");
-}
+    if (cmd == "CREATE_USER" && tokens.size() == 3) {
+        const string &id = tokens[1];
+        if (!isValidId(id)) { r = {false, "Invalid user id"}; }
+        else if (users.count(id)) { r = {false, "User already exists"}; }
+        else { users[id] = User{id, tokens[2], false, "", 0}; r = {true, "User created successfully"}; }
 
-void handleCreateGroup(const string& groupId, int clientSock) {
-    string userId = getLoggedInUser(clientSock); // check if user has loggd in 
-    if (userId.empty()) {
-        sendResponse(clientSock, "You must login first");
-        return;
-    }
-
-    if (groups.find(groupId) != groups.end()) {
-        sendResponse(clientSock, "Group already exists");
-        return;
-    }
-
-    groups[groupId] = Group{groupId, userId, {userId}, {}};
-    sendResponse(clientSock, "Group created successfully");
-}
-void handleJoinGroup(const string& groupId, int clientSock) {
-    string userId = getLoggedInUser(clientSock);
-    if (userId.empty()) {
-        sendResponse(clientSock, "You must login first");
-        return;
-    }
-
-    auto it = groups.find(groupId);
-    if (it == groups.end()) {
-        sendResponse(clientSock, "Group does not exist");
-        return;
-    }
-
-    // Prevent duplicate join request
-    if (find(it->second.joinRequests.begin(), it->second.joinRequests.end(), userId) != it->second.joinRequests.end()) {
-        sendResponse(clientSock, "Join request already sent");
-        return;
-    }
-
-    it->second.joinRequests.push_back(userId);
-    sendResponse(clientSock, "Join request sent to group owner");
-}
-void handleLeaveGroup(const string& groupId, int clientSock){
-    string userId = getLoggedInUser(clientSock);
-    if(userId.empty()){
-        sendResponse(clientSock, "You must login first");return ;
-        
-    }
-    if(groups.count(groupId)==0){
-        sendResponse(clientSock, "Group Id doesn't exist");return;
-    }
-    Group g = groups[groupId];
-    if(g.ownerId==userId){
-        sendResponse(clientSock, "you are the Owner of group. you cannot exit");return;
-    }
-    if(g.members.count(userId)){
-        sendResponse(clientSock,"You are not a member of that group");return ;
-    }
-    //////////////////////// user is member of group
-    g.members.erase(userId);
-    sendResponse(clientSock,"Left the group with id: "+groupId);
-
-}
-void handleListGroups(int clientSock) {
-    if (groups.empty()) {
-        sendResponse(clientSock, "No groups available");
-        return;
-    }
-    string response = "Available groups:\n";
-    for (auto [groupName,groupData] : groups) {
-        response += groupName + " (Owner: " + groupData.ownerId + ")\n";
-    }
-
-    sendResponse(clientSock, response);
-}
-
-
-void handleListRequests(const string& groupId, int clientSock) {
-    string userId = getLoggedInUser(clientSock);
-    if (userId.empty()) {
-        sendResponse(clientSock, "Kindly login before performing any action");
-        return;
-    }
-    if (groups.count(groupId) == 0) {
-        sendResponse(clientSock, "Group Id doesn't exist");
-        return;
-    }
-    Group &g = groups[groupId];
-    if (g.ownerId != userId) {
-        sendResponse(clientSock, "Only group owner can see join requests");
-        return;
-    }
-    if (g.joinRequests.empty()) {
-        sendResponse(clientSock, "No pending requests for group: " + groupId);
-        return;
-    }
-    string response =  "Pending join requests for " + groupId + ":\n";
-
-    for (auto &userRequested : g.joinRequests) {
-        response += "- " + userRequested + "\n";
-    }
-    sendResponse(clientSock, response);
-}
-void handleAcceptRequest(const string groupId, const string& reqUserId, int clientSock) {
-    string userId = getLoggedInUser(clientSock);
-    if (userId.empty()) {
-        sendResponse(clientSock, "You must login first");
-        return;
-    }
-
-    if (groups.count(groupId) == 0) {
-        sendResponse(clientSock, "Group Id doesn't exist");
-        return;
-    }
-
-
-    Group &g = groups[groupId];
-
-    if (g.ownerId != userId) {
-        sendResponse(clientSock, "Only owner can accept the invite request!");
-        return;
-    }
-    
-    auto it = find(g.joinRequests.begin(),g.joinRequests.end(),reqUserId);
-    if (it != g.joinRequests.end()) {
-        g.joinRequests.erase(it);
-        g.members.insert(reqUserId);
-        sendResponse(clientSock, "Accepted join request. "+ reqUserId +" is now a member of group " + groupId);
-    } else {
-        sendResponse(clientSock, "No join request from user " + reqUserId);
-    }
-    return;
-
-}
-void handleLogout(int clientSock){
-        string userId = sessionMap[clientSock];
-        users[userId].isLoggedin = false;
-        sessionMap.erase(clientSock);
-        sendResponse(clientSock, "user LoggedOut");
-}
-
-void CommandExecutor(string input,int clientSock){
-    vector<string> tokens = split(input, ' ');
-    // for(string token:tokens){
-    //     cout<<token<<" , ";
-    // }
-    if (tokens.empty()) {
-        sendResponse(clientSock, "Invalid command");
-        return;
-    }
-
-    string command = tokens[0];
-    // cout<<"command: "<<command<<" :-command"<<endl;
-    if (command == "create_user" && tokens.size()== 3 ) {
-        handleCreateUser(tokens[1], tokens[2], clientSock);
-    }
-    else if (command == "login" && tokens.size() == 3) {
-        handleLogin(tokens[1], tokens[2], clientSock);
-    }
-    else if (command == "create_group" &&  tokens.size() == 2) {
-        handleCreateGroup(tokens[1], clientSock);
-    }
-    else if (command == "join_group" &&  tokens.size() == 2 ) {
-        handleJoinGroup(tokens[1], clientSock);
-    }
-    else if (command == "leave_group" &&  tokens.size() == 2 ) {
-        handleLeaveGroup(tokens[1], clientSock);
-    }
-     else if (command == "list_groups" &&  tokens.size() == 1 ) {
-        handleListGroups( clientSock);
-    }
-    else if (command == "list_requests" &&  tokens.size() == 2 ) {
-        handleListRequests(tokens[1], clientSock);
-    }
-     else if (command == "accept_request" &&  tokens.size() == 3 ) {
-        handleAcceptRequest(tokens[1],tokens[2], clientSock);
-    }
-    else if(command=="logout"){
-        handleLogout(clientSock);
-    }
-    else {
-        cout<<"Unknown command"<<endl;
-        sendResponse(clientSock,"Unknown command");
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-/////////////////////////////////////////////////////client Command Executors 
-
-
-
-
-
-///////////////Heartbeat sender & reciever codes 
-
-void replicateCommand(const string &cmd) {
-    lock_guard<mutex> lock(hbSendMutex);
-    if (hbSockFd != -1) {
-        string msg = "sync:" + cmd + "\n";
-        if (send(hbSockFd, msg.c_str(), msg.size(), 0) <= 0) {
-            cout << "[Replicator] Failed to send command to secondary." << endl;
-        } else {
-            cout << "[Replicator] Sent cmd: " << cmd << endl;
-        }
-    }
-}
-
-
-void heartBeat_Sender(const string &peerIp, int peer_port){
-
-    try
-    {
-        
-    
-    while(true){
-        cout<<"Trying again\n";
-        int sockFd = socket(AF_INET,SOCK_STREAM,0);
-        if(sockFd<0){
-            throw runtime_error("Failed to connect Reciever socket");
-        }
-    
-    sockaddr_in peer_addr{};
-    peer_addr.sin_family = AF_INET;
-    peer_addr.sin_port = htons(peer_port);
-    inet_pton(AF_INET,peerIp.c_str(),&peer_addr.sin_addr);
-    
-
-    if(connect(sockFd,(sockaddr*)&peer_addr,sizeof(peer_addr))==0){
-        // cout<<"[Sender] connected to peer. sending hearbeats"<<endl;
-        {
-            lock_guard<mutex> lock(hbSendMutex);
-            hbSockFd = sockFd;
-        }
-         {
-                    lock_guard<mutex> lock(state_mutex);
-                    for (auto &cmd : commandLog) {
-                        string msg = "sync:" + cmd + "\n";
-                        send(sockFd, msg.c_str(), msg.size(), 0);
-                    }
-                    string done = "sync:__SYNC_DONE__\n";
-                    send(sockFd, done.c_str(), done.size(), 0);
+    } else if (cmd == "LOGIN" && tokens.size() == 5) {
+        const string &id = tokens[1];
+        auto it = users.find(id);
+        if (it == users.end()) { r = {false, "User not found"}; }
+        else if (it->second.password != tokens[2]) { r = {false, "Invalid password"}; }
+        else if (it->second.isLoggedin) { r = {false, "Already logged in; logout first"}; }
+        else {
+            it->second.isLoggedin = true;
+            it->second.lastPeerIp = tokens[3];
+            it->second.lastPeerPort = atoi(tokens[4].c_str());
+            r = {true, "Login successful"};
         }
 
-        while (true)
-        {
-            string hb = "heartbeat destination :"+ to_string(peer_port)+"\n";
-            if(send(sockFd,hb.c_str(),hb.size(),0)<=0){
-                cout<<"[Sender] connection lost. will retry .."<<endl;
-                break;
-            }
-            this_thread::sleep_for(chrono::seconds(1));
+    } else if (cmd == "LOGOUT" && tokens.size() == 2) {
+        const string &id = tokens[1];
+        auto it = users.find(id);
+        if (it == users.end() || !it->second.isLoggedin) { r = {false, "Not logged in"}; }
+        else {
+            it->second.isLoggedin = false;
+            for (auto &gp : files) for (auto &fp : gp.second) fp.second.seeders.erase(id);
+            r = {true, "Logged out; stopped sharing all files"};
         }
-        {
-        lock_guard<mutex> lock(hbSendMutex);
-        hbSockFd = -1;
-         }
-        
-    }
-    else{
-      //  cout<<"[Sender] could not connect to peer. Retrying.."<<endl;  //   peer not connected code
-    }
-    close(sockFd);
-    this_thread::sleep_for(chrono::seconds(2));
 
-    }
+    } else if (cmd == "CREATE_GROUP" && tokens.size() == 3) {
+        const string &id = tokens[1], &gid = tokens[2];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else if (!isValidId(gid)) { r = {false, "Invalid group id"}; }
+        else if (groups.count(gid)) { r = {false, "Group already exists"}; }
+        else { groups[gid] = Group{gid, id, {id}, {}}; r = {true, "Group created successfully"}; }
 
-
-    }
-    catch(const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
-    }
-
-}
-void heartBeatRecv(int listen_port){
-
-    try
-    {
-        int serverFd = socket(AF_INET,SOCK_STREAM,0);
-        if(serverFd<0){
-            throw runtime_error("Unable to open connect to sender");
+    } else if (cmd == "JOIN_GROUP" && tokens.size() == 3) {
+        const string &id = tokens[1], &gid = tokens[2];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else if (!groups.count(gid)) { r = {false, "Group does not exist"}; }
+        else {
+            Group &g = groups[gid];
+            if (g.members.count(id)) { r = {false, "Already a member of this group"}; }
+            else if (find(g.joinRequests.begin(), g.joinRequests.end(), id) != g.joinRequests.end()) {
+                r = {false, "Join request already sent"};
+            } else { g.joinRequests.push_back(id); r = {true, "Join request sent to group owner"}; }
         }
-        sockaddr_in serv_addr{};
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_addr.s_addr = INADDR_ANY;
-        serv_addr.sin_port = htons(listen_port);
-        int opt = 1;;
 
-
-        setsockopt(serverFd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-        if(bind(serverFd,(sockaddr*)&serv_addr,sizeof(serv_addr))<0){
-            throw runtime_error("bind");
+    } else if (cmd == "LEAVE_GROUP" && tokens.size() == 3) {
+        const string &id = tokens[1], &gid = tokens[2];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else if (!groups.count(gid)) { r = {false, "Group does not exist"}; }
+        else {
+            Group &g = groups[gid];
+            if (g.ownerId == id) { r = {false, "Owner cannot leave the group"}; }
+            else if (!g.members.count(id)) { r = {false, "You are not a member of this group"}; }
+            else { g.members.erase(id); r = {true, "Left group " + gid}; }
         }
-        listen(serverFd,5);
-        cout<<"[Reciver] listening for hearbeats on port  :"<<listen_port<<endl;
 
-        while(true && peerAlive){
-           
-            sockaddr_in client_addr{};
-            socklen_t len = sizeof(client_addr);
+    } else if (cmd == "LIST_GROUPS" && tokens.size() == 1) {
+        ostringstream oss;
+        for (auto &[gid, g] : groups) oss << gid << " " << g.ownerId << " " << g.members.size() << "\n";
+        r = {true, oss.str()};
 
-            int clientFd = accept(serverFd,(sockaddr *)&client_addr,&len);
-            if(clientFd<=0){
-                perror("unable to recieve");
-                continue;
-            }
-            cout<<"[Reciever] Peer connected\n";
+    } else if (cmd == "LIST_REQUESTS" && tokens.size() == 3) {
+        const string &id = tokens[1], &gid = tokens[2];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else if (!groups.count(gid)) { r = {false, "Group does not exist"}; }
+        else if (groups[gid].ownerId != id) { r = {false, "Only the group owner can view join requests"}; }
+        else {
+            ostringstream oss;
+            for (auto &u : groups[gid].joinRequests) oss << u << "\n";
+            r = {true, oss.str()};
+        }
 
-            char buffer[128];
-            string partial;
-            auto last_rev = chrono::steady_clock::now();
-             while (true) {
-                ssize_t bytes = recv(clientFd, buffer, sizeof(buffer)-1, 0);
-                if (bytes <= 0) {
-                    peerAlive = false;
-                    cout << "[Receiver] Lost connection to peer\n";
-                    close(clientFd);
-                    break;
-                }
-                peerAlive = true;
-                buffer[bytes] = '\0';
-                partial.append(buffer);
+    } else if (cmd == "ACCEPT_REQUEST" && tokens.size() == 4) {
+        const string &id = tokens[1], &gid = tokens[2], &target = tokens[3];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else if (!groups.count(gid)) { r = {false, "Group does not exist"}; }
+        else if (groups[gid].ownerId != id) { r = {false, "Only the group owner can accept requests"}; }
+        else {
+            Group &g = groups[gid];
+            auto it = find(g.joinRequests.begin(), g.joinRequests.end(), target);
+            if (it == g.joinRequests.end()) { r = {false, "No pending join request from " + target}; }
+            else { g.joinRequests.erase(it); g.members.insert(target); r = {true, "Accepted " + target + " into group " + gid}; }
+        }
 
-                size_t pos;
-                while ((pos = partial.find('\n')) != string::npos) {
-                    string line = partial.substr(0, pos);
-                    partial.erase(0, pos + 1);
-
-                    if (line.rfind("heartbeat", 0) == 0) {
-                        // cout << "[Receiver] Got heartbeat\n";       //////////heartbeat reciever code
-                    }
-                    else if (line.rfind("sync:", 0) == 0) {
-                        string cmd = line.substr(5);
-                        if (cmd == "__SYNC_DONE__") {
-                            cout << "[Receiver] Initial sync complete.\n";
-                        } else {
-                            lock_guard<mutex> lock(state_mutex);
-                            commandLog.push_back(cmd);
-                            CommandExecutor(cmd,-1);
-                            cout << "[Receiver] Synced cmd: " << cmd << endl;
-                        }
-                    }
+    } else if (cmd == "REGISTER_FILE" && tokens.size() == 8) {
+        const string &id = tokens[1], &gid = tokens[2], &fname = tokens[3];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else if (!isValidId(fname)) { r = {false, "Invalid file name (no spaces/commas allowed)"}; }
+        else if (!groups.count(gid)) { r = {false, "Group does not exist"}; }
+        else if (!isMember(groups[gid], id)) { r = {false, "You are not a member of this group"}; }
+        else {
+            long long size = atoll(tokens[4].c_str());
+            int numPieces = atoi(tokens[5].c_str());
+            const string &hash = tokens[6];
+            vector<string> pieceHashes = tokens[7].empty() ? vector<string>{} : split(tokens[7], ',');
+            if ((int)pieceHashes.size() != numPieces) {
+                r = {false, "Piece hash count does not match numPieces"};
+            } else {
+                auto &fmap = files[gid];
+                auto fit = fmap.find(fname);
+                if (fit != fmap.end() && fit->second.fileHash != hash) {
+                    r = {false, "A different file already exists under this name in the group"};
+                } else {
+                    FileInfo fi{fname, size, numPieces, hash, pieceHashes, id, {}};
+                    fi.seeders[id] = vector<bool>(numPieces, true);
+                    fmap[fname] = fi;
+                    r = {true, "File registered: " + fname};
                 }
             }
-
         }
 
+    } else if (cmd == "LIST_FILES" && tokens.size() == 3) {
+        const string &id = tokens[1], &gid = tokens[2];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else if (!groups.count(gid)) { r = {false, "Group does not exist"}; }
+        else if (!isMember(groups[gid], id)) { r = {false, "You are not a member of this group"}; }
+        else {
+            ostringstream oss;
+            auto fit = files.find(gid);
+            if (fit != files.end())
+                for (auto &[fname, fi] : fit->second)
+                    oss << fname << " " << fi.fileSize << " " << fi.numPieces << " " << fi.seeders.size() << "\n";
+            r = {true, oss.str()};
+        }
+
+    } else if (cmd == "GET_PEERS" && tokens.size() == 4) {
+        const string &id = tokens[1], &gid = tokens[2], &fname = tokens[3];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else if (!groups.count(gid)) { r = {false, "Group does not exist"}; }
+        else if (!isMember(groups[gid], id)) { r = {false, "You are not a member of this group"}; }
+        else {
+            auto fit = files.find(gid);
+            if (fit == files.end() || !fit->second.count(fname)) { r = {false, "File not found in group"}; }
+            else {
+                FileInfo &fi = fit->second[fname];
+                ostringstream oss;
+                oss << fi.fileSize << " " << fi.numPieces << " " << fi.fileHash << "\n";
+                oss << join(fi.pieceHashes, ',') << "\n";
+                oss << fi.seeders.size() << "\n";
+                for (auto &[uid, bm] : fi.seeders) {
+                    auto uit = users.find(uid);
+                    string ip = uit != users.end() ? uit->second.lastPeerIp : "";
+                    int port = uit != users.end() ? uit->second.lastPeerPort : 0;
+                    oss << uid << " " << ip << " " << port << " " << bitmapToHex(bm) << "\n";
+                }
+                r = {true, oss.str()};
+            }
+        }
+
+    } else if (cmd == "UPDATE_SEED" && tokens.size() == 5) {
+        const string &id = tokens[1], &gid = tokens[2], &fname = tokens[3];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else {
+            auto fit = files.find(gid);
+            if (fit == files.end() || !fit->second.count(fname)) { r = {false, "File not found"}; }
+            else if (!isMember(groups[gid], id)) { r = {false, "You are not a member of this group"}; }
+            else {
+                FileInfo &fi = fit->second[fname];
+                vector<bool> incoming = hexToBitmap(tokens[4], fi.numPieces);
+                auto &bm = fi.seeders[id];
+                if (bm.size() != (size_t)fi.numPieces) bm.assign(fi.numPieces, false);
+                for (int i = 0; i < fi.numPieces; i++) bm[i] = bm[i] || incoming[i];
+                r = {true, "Seed status updated"};
+            }
+        }
+
+    } else if (cmd == "STOP_SHARE" && tokens.size() == 4) {
+        const string &id = tokens[1], &gid = tokens[2], &fname = tokens[3];
+        if (!loggedIn(id)) { r = {false, "You must login first"}; }
+        else {
+            auto fit = files.find(gid);
+            if (fit == files.end() || !fit->second.count(fname)) { r = {false, "File not found"}; }
+            else { fit->second[fname].seeders.erase(id); r = {true, "Stopped sharing " + fname}; }
+        }
     }
-    catch(const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
-    }
-    
+
+    if (r.ok) stateVersion++;
+    return r;
 }
 
+// ------------------------------------------------------- SNAPSHOT SYNC
 
+string serializeSnapshot() {
+    lock_guard<mutex> lock(stateMutex);
+    ostringstream oss;
+    oss << stateVersion << "\n";
+    for (auto &[id, u] : users)
+        oss << "USER," << id << "," << u.password << "," << (u.isLoggedin ? 1 : 0) << ","
+            << u.lastPeerIp << "," << u.lastPeerPort << "\n";
+    for (auto &[gid, g] : groups) {
+        vector<string> mem(g.members.begin(), g.members.end());
+        oss << "GROUP," << gid << "," << g.ownerId << "," << join(mem, ';') << "," << join(g.joinRequests, ';') << "\n";
+    }
+    for (auto &[gid, fmap] : files) {
+        for (auto &[fname, fi] : fmap) {
+            oss << "FILE," << gid << "," << fname << "," << fi.fileSize << "," << fi.numPieces << ","
+                << fi.fileHash << "," << join(fi.pieceHashes, ';') << "," << fi.ownerId << "\n";
+            for (auto &[uid, bm] : fi.seeders)
+                oss << "SEED," << gid << "," << fname << "," << uid << "," << bitmapToHex(bm) << "\n";
+        }
+    }
+    return oss.str();
+}
 
+// Adopts a peer's full state wholesale iff its version is strictly newer
+// than ours. Because only the primary ever originates writes, and every
+// tracker's version only advances by applying an accepted/replayed
+// mutation, "higher version" reliably means "more complete history" -
+// there is no independent history on a secondary that this could clobber.
+void mergeSnapshotIfNewer(uint64_t peerVersion, const string &body) {
+    lock_guard<mutex> lock(stateMutex);
+    if (peerVersion <= stateVersion) return;
 
+    users.clear();
+    groups.clear();
+    files.clear();
+    stringstream ss(body);
+    string line;
+    while (getline(ss, line)) {
+        if (line.empty()) continue;
+        vector<string> f = split(line, ',');
+        if (f[0] == "USER" && f.size() >= 6) {
+            users[f[1]] = User{f[1], f[2], f[3] == "1", f[4], f[5].empty() ? 0 : atoi(f[5].c_str())};
+        } else if (f[0] == "GROUP" && f.size() >= 5) {
+            Group g; g.id = f[1]; g.ownerId = f[2];
+            if (!f[3].empty()) for (auto &m : split(f[3], ';')) g.members.insert(m);
+            if (!f[4].empty()) g.joinRequests = split(f[4], ';');
+            groups[f[1]] = g;
+        } else if (f[0] == "FILE" && f.size() >= 8) {
+            FileInfo fi;
+            fi.fileName = f[2]; fi.fileSize = atoll(f[3].c_str()); fi.numPieces = atoi(f[4].c_str());
+            fi.fileHash = f[5];
+            if (!f[6].empty()) fi.pieceHashes = split(f[6], ';');
+            fi.ownerId = f[7];
+            files[f[1]][f[2]] = fi;
+        } else if (f[0] == "SEED" && f.size() >= 5) {
+            auto git = files.find(f[1]);
+            if (git != files.end()) {
+                auto fit = git->second.find(f[2]);
+                if (fit != git->second.end()) fit->second.seeders[f[3]] = hexToBitmap(f[4], fit->second.numPieces);
+            }
+        }
+    }
+    stateVersion = peerVersion;
+}
 
+// --------------------------------------------------------- TRACKER MESH
 
+vector<TrackerAddr> allTrackers;
+int myIdx;
 
-/// //////////////////////////////////
+struct PeerLink {
+    int idx;
+    string ip;
+    int syncPort;
+    atomic<int> fd;
+    atomic<bool> alive;
+    mutex sendMx;
+    PeerLink(int i, string ipAddr, int sp) : idx(i), ip(move(ipAddr)), syncPort(sp), fd(-1), alive(false) {}
+};
+deque<PeerLink> peerLinks;
 
-void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
-    try
-    {
-        /* code */
-    
-    while(1){
-        char buffer[1024];
-        ssize_t bytes= recv(clientSock_fd,buffer,sizeof(buffer)-1,0);
-        if(bytes<=0){
-            perror("client connection failed");
-            // continue;
+PeerLink *findLink(int idx) {
+    for (auto &l : peerLinks) if (l.idx == idx) return &l;
+    return nullptr;
+}
+
+int currentPrimaryIdx() {
+    int best = myIdx;
+    for (auto &l : peerLinks) if (l.alive && l.idx < best) best = l.idx;
+    return best;
+}
+
+void broadcastOp(const string &line) {
+    string frame = "OP\n" + line;
+    for (auto &link : peerLinks) {
+        if (link.alive) {
+            lock_guard<mutex> lk(link.sendMx);
+            int fd = link.fd;
+            if (fd != -1) sendFrame(fd, frame);
+        }
+    }
+}
+
+void processPeerFrame(PeerLink &link, const string &frame) {
+    size_t nl = frame.find('\n');
+    string type = (nl == string::npos) ? frame : frame.substr(0, nl);
+    string body = (nl == string::npos) ? "" : frame.substr(nl + 1);
+    if (type == "SNAPSHOT") {
+        size_t nl2 = body.find('\n');
+        uint64_t ver = 0;
+        try { ver = stoull(body.substr(0, nl2)); } catch (...) { return; }
+        string rest = (nl2 == string::npos) ? "" : body.substr(nl2 + 1);
+        uint64_t before = stateVersion;
+        mergeSnapshotIfNewer(ver, rest);
+        if (stateVersion != before)
+            logLine("[Sync] Adopted newer state from tracker " + to_string(link.idx) + " (version -> " + to_string(stateVersion) + ")");
+    } else if (type == "OP") {
+        vector<string> tokens = split(body, ' ');
+        if (!tokens.empty()) applyCommand(tokens);
+    }
+    // HELLO / HB carry no further action beyond updating liveness (handled by caller).
+}
+
+// Shared read/heartbeat loop used by both the dialing side and the
+// accepting side of a tracker-to-tracker link once the handshake is done.
+void runLinkLoop(PeerLink &link) {
+    int fd = link.fd;
+    auto now0 = chrono::steady_clock::now();
+    auto lastRecv = now0;
+    // Start "due" so the first heartbeat goes out on the very first loop
+    // iteration. (Using time_point::min() here would look tempting but
+    // subtracting it from `now` overflows the duration's underlying
+    // representation - undefined behavior - so we offset from `now`
+    // instead, which stays within a normal, safe range.)
+    auto lastSent = now0 - chrono::seconds(TRACKER_HEARTBEAT_INTERVAL_SEC);
+    while (true) {
+        struct pollfd pfd { fd, POLLIN, 0 };
+        int pr = poll(&pfd, 1, 1000);
+        auto now = chrono::steady_clock::now();
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            string frame;
+            if (!recvFrame(fd, frame)) break;
+            lastRecv = now;
+            processPeerFrame(link, frame);
+        } else if (pr < 0) {
             break;
         }
-        buffer[bytes] = '\0';
-        
-        if(role==Tracker_role::PRIMARY){
-
-            string cmd(buffer);
-            appendCommandLog(cmd);
-    
-            cout<<"[Primary] logged & Serving client request : "<<cmd<<endl;
-            CommandExecutor(cmd,clientSock_fd);    // execute the command sent by client
-            replicateCommand(buffer);   // send the same command to secondary tracker
-        }else{
-            cout<<"[secondary] Ignoring client request ";
+        if (chrono::duration_cast<chrono::seconds>(now - lastRecv).count() >= TRACKER_PEER_TIMEOUT_SEC) {
+            logLine("[Sync] Tracker " + to_string(link.idx) + " timed out");
+            break;
+        }
+        if (chrono::duration_cast<chrono::seconds>(now - lastSent).count() >= TRACKER_HEARTBEAT_INTERVAL_SEC) {
+            lock_guard<mutex> lk(link.sendMx);
+            if (!sendFrame(fd, string("HB\n"))) break;
+            lastSent = now;
         }
     }
-   
-   
-    }
-    catch(const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
-    }
-    close(clientSock_fd);
-
+    link.alive = false;
+    link.fd = -1;
+    close(fd);
+    logLine("[Sync] Link to tracker " + to_string(link.idx) + " is down");
 }
 
-
-
-int main(int argc, char *argv[])
-{
-    try
-    {
- 
-    signal(SIGPIPE,SIG_IGN);
-    if(argc!=3){
-        throw runtime_error("Incorrect args");
+void dialLoop(PeerLink *link) {
+    while (true) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(link->syncPort);
+            inet_pton(AF_INET, link->ip.c_str(), &addr.sin_addr);
+            if (connect(fd, (sockaddr *)&addr, sizeof(addr)) == 0) {
+                logLine("[Sync] Connected to tracker " + to_string(link->idx));
+                sendFrame(fd, "HELLO\n" + to_string(myIdx));
+                sendFrame(fd, "SNAPSHOT\n" + serializeSnapshot());
+                link->fd = fd;
+                link->alive = true;
+                runLinkLoop(*link); // blocks until the link drops
+            } else {
+                close(fd);
+            }
+        }
+        this_thread::sleep_for(chrono::seconds(2));
     }
-    string filepath = argv[1];
-///////////////////////////////////////////  List of trackers fetched from tracker_info file
-    vector<vector<string>>ports  = getPortVector(filepath);
-    
-    int trackerNo = stoi(argv[2]);
-    trackerNo--;
+}
 
-    vector<string> myIpPort = ports[trackerNo];
-    vector<string> peerIpPort = ports[(trackerNo+1)%2];
-    int port =stoi( myIpPort[1]);
-    int peerPort =stoi( peerIpPort[1]);
-    
+void acceptedPeerHandler(int fd) {
+    string frame;
+    if (!recvFrame(fd, frame)) { close(fd); return; }
+    size_t nl = frame.find('\n');
+    if (frame.substr(0, nl) != "HELLO") { close(fd); return; }
+    int peerIdx;
+    try { peerIdx = stoi(frame.substr(nl + 1)); } catch (...) { close(fd); return; }
+    PeerLink *link = findLink(peerIdx);
+    if (!link) { close(fd); return; }
+    logLine("[Sync] Accepted connection from tracker " + to_string(peerIdx));
+    sendFrame(fd, "HELLO\n" + to_string(myIdx));
+    sendFrame(fd, "SNAPSHOT\n" + serializeSnapshot());
+    link->fd = fd;
+    link->alive = true;
+    runLinkLoop(*link);
+}
 
-    cout<<"Myport "<<port<<" ,peerport: "<<peerPort<<endl;
-
-    string ipaddr = ports[trackerNo][0];
-    role = (trackerNo==0? Tracker_role::PRIMARY : Tracker_role::SECONDARY);
-
-       cout << "Tracker running on port " << port << " Role: " << ((role == Tracker_role::PRIMARY) ? "PRIMARY" : "SECONDARY") << endl;
-
-    // int ipaddr = 
-    int sock_fd;
-    sock_fd= socket(AF_INET,SOCK_STREAM,0);
-    if(sock_fd==-1){
-        perror("Unable to create socket fd");
+void syncAcceptLoop(int listenFd) {
+    while (true) {
+        sockaddr_in addr{};
+        socklen_t len = sizeof(addr);
+        int fd = accept(listenFd, (sockaddr *)&addr, &len);
+        if (fd >= 0) thread(acceptedPeerHandler, fd).detach();
     }
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-    int opt =1;
-    setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    bind(sock_fd,(sockaddr * )&addr,sizeof(addr));  
-    listen(sock_fd, SOMAXCONN);
+}
 
-    cout << "Tracker running on "<<port<<" ...\n";
-
-
-    thread hb_thread;
-    if(role==Tracker_role::PRIMARY){
-      hb_thread =  thread(heartBeat_Sender, peerIpPort[0],peerPort+100); // send to peer's hb port
-    }else{
-      hb_thread =   thread(heartBeatRecv, port + 100);  // listen for peer on port+100
-
+void electionTicker() {
+    int lastRole = -2; // -2 = uninitialized, forces first log
+    while (true) {
+        int p = currentPrimaryIdx();
+        int role = (p == myIdx) ? 1 : 0;
+        if (role != lastRole) {
+            logLine(role ? "[Election] This tracker is now PRIMARY" : "[Election] This tracker is now SECONDARY (primary is tracker " + to_string(p + 1) + ")");
+            lastRole = role;
+        }
+        this_thread::sleep_for(chrono::milliseconds(500));
     }
-    hb_thread.detach();
-    //////////////////////////////////////////  monitor thread keeps on checking if primary is alive or not
+}
 
-    thread monitorThread(monitorPeer);
-    monitorThread.detach();
+// -------------------------------------------------------- CLIENT HANDLING
 
-    //////////////////////////////////////////////
-    while(true){
+void handleClient(int fd) {
+    while (true) {
+        string line;
+        if (!recvFrame(fd, line)) break;
+        line = trim(line);
+        vector<string> tokens = split(line, ' ');
+        if (tokens.empty() || tokens[0].empty()) { sendFrame(fd, string("ERR Empty command")); continue; }
 
-        sockaddr_in clientSockAddr;
-        socklen_t len = sizeof(clientSockAddr);
-        int newSocket_fd = accept(sock_fd,(sockaddr*)&clientSockAddr,&len);
-        if(newSocket_fd<=0){
-            this_thread::sleep_for(chrono::milliseconds(100));
-            
-        }else{
-              thread(handleClient,newSocket_fd,clientSockAddr).detach();
-        }   
-        
-      
+        const string &cmd = tokens[0];
+        if (isMutatingCommand(cmd)) {
+            int p = currentPrimaryIdx();
+            if (p != myIdx) {
+                sendFrame(fd, "ERR NOT_PRIMARY " + allTrackers[p].ip + " " + to_string(allTrackers[p].port));
+                continue;
+            }
+        }
+
+        HandlerResult r = applyCommand(tokens);
+        if (isMutatingCommand(cmd) && r.ok) broadcastOp(line);
+        sendFrame(fd, (r.ok ? "OK " : "ERR ") + r.message);
+    }
+    close(fd);
+}
+
+void consoleReader() {
+    string line;
+    while (getline(cin, line)) {
+        if (trim(line) == "quit") {
+            logLine("[Console] Shutting down tracker.");
+            exit(0);
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    signal(SIGPIPE, SIG_IGN);
+    if (argc != 3) {
+        cerr << "Usage: " << argv[0] << " <tracker_info.txt> <tracker_no>" << endl;
+        return 1;
     }
 
-    }
-    catch(const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
+    try {
+        allTrackers = parseTrackerList(argv[1]);
+        int trackerNo = atoi(argv[2]);
+        if (trackerNo < 1 || trackerNo > (int)allTrackers.size()) {
+            throw runtime_error("tracker_no out of range for tracker_info.txt");
+        }
+        myIdx = trackerNo - 1;
+
+        for (int i = 0; i < (int)allTrackers.size(); i++) {
+            if (i == myIdx) continue;
+            peerLinks.emplace_back(i, allTrackers[i].ip, allTrackers[i].port + SYNC_PORT_OFFSET);
+        }
+
+        int myPort = allTrackers[myIdx].port;
+        int mySyncPort = myPort + SYNC_PORT_OFFSET;
+
+        int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+        if (clientFd < 0) throw runtime_error("socket() failed for client listener");
+        int opt = 1;
+        setsockopt(clientFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        sockaddr_in caddr{};
+        caddr.sin_family = AF_INET;
+        caddr.sin_addr.s_addr = INADDR_ANY;
+        caddr.sin_port = htons(myPort);
+        if (bind(clientFd, (sockaddr *)&caddr, sizeof(caddr)) < 0) throw runtime_error("bind() failed on client port " + to_string(myPort));
+        listen(clientFd, SOMAXCONN);
+
+        int syncFd = socket(AF_INET, SOCK_STREAM, 0);
+        if (syncFd < 0) throw runtime_error("socket() failed for sync listener");
+        setsockopt(syncFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        sockaddr_in saddr{};
+        saddr.sin_family = AF_INET;
+        saddr.sin_addr.s_addr = INADDR_ANY;
+        saddr.sin_port = htons(mySyncPort);
+        if (bind(syncFd, (sockaddr *)&saddr, sizeof(saddr)) < 0) throw runtime_error("bind() failed on sync port " + to_string(mySyncPort));
+        listen(syncFd, SOMAXCONN);
+
+        logLine("[Tracker " + to_string(trackerNo) + "] listening for clients on port " + to_string(myPort) +
+                ", tracker sync on port " + to_string(mySyncPort) + " (" + to_string(allTrackers.size()) + " trackers configured)");
+
+        for (auto &link : peerLinks)
+            if (link.idx > myIdx) thread(dialLoop, &link).detach();
+
+        thread(syncAcceptLoop, syncFd).detach();
+        thread(electionTicker).detach();
+        thread(consoleReader).detach();
+
+        while (true) {
+            sockaddr_in caddr2{};
+            socklen_t len = sizeof(caddr2);
+            int fd = accept(clientFd, (sockaddr *)&caddr2, &len);
+            if (fd >= 0) thread(handleClient, fd).detach();
+        }
+    } catch (const std::exception &e) {
+        cerr << "[Tracker] Fatal: " << e.what() << endl;
+        return 1;
     }
 }
